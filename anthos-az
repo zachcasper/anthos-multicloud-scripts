@@ -1,0 +1,489 @@
+#
+#  Script to create Anthos clusters in Azure by calling the API via curl.
+#  Prerequisites:
+#
+#    1. az CLI installed and az login configured
+#    2. Preferred Azure subscription is the default
+#    3. gcloud installed
+#    4. gcloud init configured with the preferred GCP project
+#    5. jq installed
+#
+#  To use:
+#
+#  1.  Copy ./config.template to ./config
+#
+#  2.  Edit values in ./config
+#
+#  3.  ./anthos-az COMMAND
+#
+#  Run ./anthos-az with no command for help.
+#
+#  Author:  zcasper@google.com
+#  December 8, 2020
+#
+
+#!/bin/bash
+set -e
+
+get-config() {
+  . config
+}
+
+get-vars() {
+  # Azure subscription ID, assumes the default subscription
+  export SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+  # Azure AD tenant ID
+  export AD_TENANT_ID=$(az account list \
+    --query "[?id=='${SUBSCRIPTION_ID}'].{tenantId:tenantId}" --output tsv)
+  export VNET_ID=$(az network vnet list \
+    --query "[?name=='${VNET_NAME}'].{ID:id}" --output tsv)
+  # An existing Azure subnet to use
+  export SUBNET_ID=$(az network vnet subnet list -g ${VNET_RESOURCE_GROUP} \
+    --vnet-name "${VNET_NAME}" \
+    --query "[?name=='${SUBNET_NAME}'].{ID:id}" \
+    --output tsv)
+  # Azure ssh key if exists (if not, it will be created later)
+  if [[ -f ./anthos-azure-ssh-key.pub ]]; then 
+    export SSH_PUBLIC_KEY=$(cat ./anthos-azure-ssh-key.pub | base64 -w 0)
+  fi
+  # The Google Cloud project this cluster will be associated with
+  export PROJECT_ID="$(gcloud config get-value project)"
+  export PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" \
+    --format "value(projectNumber)")
+  # The key name stored in Google Secret Manager
+  export SECRET_NAME="anthos-azure-secret"
+  # String to identify the multi-cloud API's service account within Azure
+  # Unique to the Google Cloud project
+  export ANTHOS_SA_APP_NAME="${PROJECT_ID}-anthos-api"
+  export ANTHOS_SA_APP_ID=$(az ad app list --all \
+    --query "[?displayName=='${ANTHOS_SA_APP_NAME}'].appId" \
+    --all --output tsv)
+  # Google service account for the Connect agent to communicate with Google
+  export CONNECT_SA_NAME=${CLUSTER_NAME}-sa
+}
+
+create-vnet() {
+  get-config
+  get-vars
+
+  az network nsg create -n "nsg-allowallinout" -g "${VNET_RESOURCE_GROUP}"
+
+  az network nsg rule create -n "allowallin" -g "${VNET_RESOURCE_GROUP}" \
+    --access allow \
+    --destination-address-prefix '*' \
+    --destination-port-range '*' \
+    --direction inbound \
+    --nsg-name "nsg-allowallinout" \
+    --protocol tcp \
+    --source-address-prefix '*' \
+    --source-port-range '*' \
+    --priority 100
+
+  az network nsg rule create -n "allowallout" -g "${VNET_RESOURCE_GROUP}" \
+    --access allow \
+    --destination-address-prefix '*' \
+    --destination-port-range '*' \
+    --direction outbound \
+    --nsg-name "nsg-allowallinout" \
+    --protocol tcp \
+    --source-address-prefix '*' \
+    --source-port-range '*' \
+    --priority 101
+
+  az network vnet create -n "${VNET_NAME}" -g "${VNET_RESOURCE_GROUP}" \
+    --address-prefix 10.0.0.0/16
+
+  az network vnet subnet create -n ${SUBNET_NAME} -g "${VNET_RESOURCE_GROUP}" \
+    --vnet-name "${VNET_NAME}" \
+    --network-security-group "nsg-allowallinout" \
+    --address-prefixes 10.0.1.0/24
+
+  echo "Created VNet ${VNET_NAME} and subnet ${SUBNET_NAME}."
+  exit 0
+}
+
+create-secrets() {
+  get-config
+  get-vars
+
+  openssl req -x509 -newkey rsa:4096 -keyout /tmp/tmpkey.pem -out \
+    /tmp/tmpcert.pem -days 365 -nodes  -subj "/CN=gkemulticloud"
+
+  CERT_CONTENT="$(tail -n+2 /tmp/tmpcert.pem | head -n-1)"
+  SECRET_CONTENT="$(cat /tmp/tmpkey.pem /tmp/tmpcert.pem)"
+  echo -n "${SECRET_CONTENT}" | gcloud secrets create ${SECRET_NAME} \
+    --replication-policy="automatic" \
+    --data-file=-
+
+  GKE_SA="gke-multicloud-service@boq-nonprod-gkemulticloud.iam.gserviceaccount.com"
+  gcloud projects add-iam-policy-binding $(gcloud config get-value project) \
+    --member="serviceAccount:${GKE_SA}" \
+    --role="roles/secretmanager.secretAccessor" \
+    --condition="expression=resource.name=='${SECRET_NAME}',title=anthos_service_account_access,description=Allow Anthos service account access to secret"
+
+  echo "Created secret ${SECRET_NAME} in Google Secrets Manager"
+
+  az ad app create --display-name "${ANTHOS_SA_APP_NAME}" \
+    --key-usage Verify \
+    --key-value "${CERT_CONTENT}"
+
+  rm /tmp/tmpcert.pem
+
+  export ANTHOS_SA_APP_ID=$(az ad app list --all \
+  --query "[?displayName=='${ANTHOS_SA_APP_NAME}'].appId" \
+  --all --output tsv)
+
+  az ad sp create --id "${ANTHOS_SA_APP_ID}"
+
+  echo "Registered ${ANTHOS_SA_APP_NAME} in Azure AD and created a service principal"
+
+  SP_ID=$(az ad sp list --all \
+    --query "[?contains(displayName,'${ANTHOS_SA_APP_NAME}')].{SP_ID:servicePrincipalNames[0]}" \
+    --output tsv)
+
+  az role assignment create --role "User Access Administrator" \
+    --assignee "${SP_ID}" --scope "/subscriptions/${SUBSCRIPTION_ID}"
+  az role assignment create --role "Virtual Machine Contributor" \
+    --assignee "${SP_ID}" --scope "/subscriptions/${SUBSCRIPTION_ID}"
+  az role assignment create --role "Network Contributor" \
+    --assignee "${SP_ID}" --scope "/subscriptions/${SUBSCRIPTION_ID}"
+  az role assignment create --role "Managed Identity Contributor" \
+    --assignee "${SP_ID}" --scope "/subscriptions/${SUBSCRIPTION_ID}"
+  az role assignment create --role "Managed Identity Operator" \
+    --assignee "${SP_ID}" --scope "/subscriptions/${SUBSCRIPTION_ID}"
+  az role assignment create --role "Managed Application Contributor Role" \
+    --assignee "${SP_ID}" --scope "/subscriptions/${SUBSCRIPTION_ID}"
+
+  echo "
+Granted the following permissions to the Anthos service account:
+User Access Administrator
+Virtual Machine Contributor
+Network Contributor
+Managed Identity Contributor
+Managed Identity Operator
+Managed Application Contributor Role
+"
+  exit 0
+}
+
+create-cluster() {
+  get-config
+  get-vars
+
+  # TODO:  Clean up
+  ssh-keygen -t rsa -m PEM -b 4096 -C "ssh key for Anthos VMs created by $USER" \
+    -f ./anthos-azure-ssh-key -N ""
+  export SSH_PUBLIC_KEY=$(cat ./anthos-azure-ssh-key.pub | base64 -w 0)
+
+  cat > create_cluster.json <<EOF
+{
+    "name": "${CLUSTER_NAME}",
+    "description": "My first Anthos cluster",
+    "azure_region": "${AZURE_REGION}",
+    "networking": {
+        "virtual_network_id": "${VNET_ID}",
+        "pod_address_cidr_blocks": "10.200.0.0/16",
+        "service_address_cidr_blocks":"10.32.0.0/24"
+    },
+    "control_plane": {
+        "version": "1.18",
+        "subnet_id": "${SUBNET_ID}",
+        "vm_size": "Standard_DS1_v2",
+       "ssh_public_key": "${SSH_PUBLIC_KEY}",
+        "root_volume": {
+            "size_gib": 16
+        },
+        "main_volume": {
+            "size_gib": 8
+        },
+        "azure_services_authentication": {
+            "subscription": "${SUBSCRIPTION_ID}",
+            "aad_tenant": "${AD_TENANT_ID}",
+            "aad_application": "${ANTHOS_SA_APP_ID}",
+            "aad_application_keypair_secret": "projects/${PROJECT_ID}/secrets/${SECRET_NAME}"
+        },
+        "tags": {
+            "environment":"dev"
+        }
+    }
+}
+EOF
+
+  set -x
+  curl -X POST \
+    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters?azure_cluster_id=${CLUSTER_NAME} \
+    -H "Content-Type: application/json" \
+    -H "X-GFE-SSL: yes" \
+    -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+    -d @create_cluster.json
+  set +x
+
+  echo "The cluster ${CLUSTER_NAME} is being created. The Cluster configuration file is was kept in create_cluster.json.  Use anthos-az get-cluster to check the cluster status."
+  echo "A new ssh key has been created and stored in ./anthos-azure-ssh-key."
+  exit 0
+
+}
+
+create-node-pool() {
+  get-config
+  get-vars
+
+  cat > create_nodepool.json <<EOF 
+{
+    "name": "${NODE_POOL_NAME}",
+    "version": "1.18",
+    "subnet_id": "${SUBNET_ID}",
+    "autoscaling": {
+        "min_node_count": 2,
+        "max_node_count": 2
+    },
+    "vm_size": "Standard_DS1_v2",
+    "ssh_public_key": "${SSH_PUBLIC_KEY}"
+}
+EOF
+
+  set -x
+  curl -X POST \
+    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/"${PROJECT_NUMBER}"/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}/azureNodePools?azure_node_pool_id=${NODE_POOL_NAME} \
+    -H "Content-Type: application/json" \
+    -H "X-GFE-SSL: yes" \
+    -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+    -d @create_nodepool.json
+  set +x
+
+  echo "The node poll ${NODE_POOL_NAME} is being created. The node pool configuration file is was kept in create_nodepool.json. Use anthos-az get-node-pool to check the node pool status."
+  exit 0
+
+}
+
+get-cluster() {
+  get-config
+  get-vars
+
+  set -x
+  curl -X GET \
+    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME} \
+    -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer `gcloud auth print-access-token`"
+  exit 0
+
+}
+
+get-node-pool() {
+  get-config
+  get-vars
+
+  set -x
+  curl -X GET \
+    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}/azureNodePools/${NODE_POOL_NAME} \
+    -H "Content-Type: application/json" \
+    -H "X-GFE-SSL: yes" \
+    -H "Authorization: Bearer $(gcloud auth print-access-token)"
+  exit 0
+
+}
+
+get-credentials() {
+  get-config
+  get-vars
+
+  curl -X GET \
+    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}:getAzureClusterAdminKubeconfig \
+    -H "Content-Type: application/json" \
+    -H "X-GFE-SSL: yes" \
+    -H "Authorization: Bearer $(gcloud auth print-access-token)" | \
+    jq .kubeconfig -r > ~/.kube/${CLUSTER_NAME}.yaml
+
+  if [[ -f ${HOME}/.kube/config ]]; then
+    cp ${HOME}/.kube/config ${HOME}/.kube/config.backup.$(date +%Y-%m-%d.%H:%M:%S)
+  fi
+  if [[ -z "$KUBECONFIG" ]]; then
+    export KUBECONFIG=${HOME}/.kube/config:${HOME}/.kube/${CLUSTER_NAME}.yaml
+    kubectl config view --merge --flatten > ${HOME}/.kube/merged_kubeconfig
+    mv ${HOME}/.kube/merged_kubeconfig ${HOME}/.kube/config
+  unset KUBECONFIG
+  else
+    export OLD_KUBECONFIG=$KUBECONFIG
+    export KUBECONFIG=${KUBECONFIG}:${HOME}/.kube/${CLUSTER_NAME}.yaml
+    kubectl config view --merge --flatten > ${HOME}/.kube/merged_kubeconfig
+    mv ${HOME}/.kube/merged_kubeconfig ${HOME}/.kube/config
+    export KUBECONFIG=$OLD_KUBECONFIG
+  fi
+
+  kubectl config use-context $(kubectl config view -o=jsonpath="{.current-context}" \
+    --kubeconfig ${HOME}/.kube/${CLUSTER_NAME}.yaml) --kubeconfig ${HOME}/.kube/config
+  rm ${HOME}/.kube/${CLUSTER_NAME}.yaml
+
+  echo "The KUBECONFIG has been merged into ~/.kube/config."
+  exit 0
+
+}
+
+delete-vnet() {
+  get-config
+  get-vars
+
+  az network vnet delete --ids "${VNET_ID}"
+  az network nsg delete -n "nsg-allowallinout" -g "${VNET_RESOURCE_GROUP}"
+
+  echo "The VNet ${VNET_NAME} has been deleted."
+  exit 0
+
+}
+
+delete-secrets() {
+  get-config
+  get-vars
+
+  gcloud secrets delete ${SECRET_NAME}
+
+  echo "The secret in Google Cloud has been deleted."
+
+  az ad sp delete --id "$(az ad app list --all \
+  --query "[?displayName=='${ANTHOS_SA_APP_NAME}'].appId" \
+  --output tsv)"
+
+  echo "The Azure AD app registration and service principal have been deleted."
+  exit 0
+
+}
+
+delete-cluster() {
+  get-config
+  get-vars
+
+  curl -X DELETE \
+    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME} \
+    -H "Content-Type: application/json" \
+    -H "X-GFE-SSL: yes" \
+    -H "Authorization: Bearer $(gcloud auth print-access-token)"
+
+  echo "The cluster ${CLUSTER_NAME} is being deleted.  Check the status via anthos-az get-cluster."
+  exit 0
+
+}
+
+delete-node-pool() {
+  get-config
+  get-vars
+
+  set -x
+  curl -X DELETE \
+    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}/azureNodePools/${NODE_POOL_NAME}\
+    -H "Content-Type: application/json" \
+    -H "X-GFE-SSL: yes" \
+    -H "Authorization: Bearer $(gcloud auth print-access-token)"
+  set +x
+
+  echo "The node pool ${NODE_POOL_NAME} is being deleted.  Check the status via anthos-az get-node-pool."
+  exit 0
+
+}
+
+register-cluster() {
+  get-config
+  get-vars
+
+  gcloud iam service-accounts create ${CONNECT_SA_NAME}
+  gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:${CONNECT_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/gkehub.connect" \
+    --condition "expression=resource.name=='projects/${PROJECT_ID}/locations/global/memberships/${CLUSTER_NAME}',title=bind-${CONNECT_SA_NAME}-to-${CLUSTER_NAME}"
+
+  gcloud iam service-accounts keys create \
+    /tmp/creds/${CONNECT_SA_NAME}-${CLUSTER_NAME}.json \
+    --iam-account=${CONNECT_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com
+
+  gcloud container hub memberships register ${CLUSTER_NAME} \
+    --context $(kubectl config view -o=jsonpath="{.current-context}") \
+    --service-account-key-file=/tmp/creds/${CONNECT_SA_NAME}-${CLUSTER_NAME}.json
+
+  kubectl create clusterrolebinding default-admin-user-binding \
+    --clusterrole cluster-admin --serviceaccount default:default
+
+  TOKEN=$(kubectl get secret $(kubectl get serviceaccount default -o jsonpath='{$.secrets[0].name}') -o jsonpath='{$.data.token}' | base64 --decode)
+  echo "The token for the default Kubernetes service account is:"
+  echo $TOKEN
+  echo "Login via the Google Cloud Console using this token."
+  exit 0
+
+}
+
+unregister-cluster() {
+  get-config
+  get-vars
+
+  set +e
+  gcloud container hub memberships delete ${CLUSTER_NAME}
+  gcloud iam service-accounts delete ${CONNECT_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com
+
+  echo "The cluster has been de-registered and the Connect service account deleted."
+  exit 0
+
+}
+
+case $1 in
+  create-vnet)
+    create-vnet
+    ;;
+  create-secrets)
+    create-secrets
+    ;;
+  create-cluster)
+    create-cluster
+    ;;
+  create-node-pool)
+    create-node-pool
+    ;;
+  get-cluster)
+    get-cluster
+    ;;
+  get-node-pool)
+    get-node-pool
+    ;;
+  get-credentials)
+    get-credentials
+    ;;
+  delete-vnet)
+    delete-vnet
+    ;;
+  delete-secrets)
+    delete-secrets
+    ;;
+  delete-cluster)
+    delete-cluster
+    ;;
+  delete-node-pool)
+    delete-node-pool
+    ;;
+  register-cluster)
+    register-cluster
+    ;;
+  unregister-cluster)
+    unregister-cluster
+    ;;
+  *)
+    echo "
+Usage:  anthos-az COMMAND
+
+All commands read from ./config
+Commands:
+  create-vnet
+  create-secrets
+  create-cluster
+  create-node-pool
+  get-cluster
+  get-node-pool
+  get-credentials
+  delete-vnet
+  delete-secrets
+  delete-cluster
+  delete-node-pool
+  register-cluster
+  unregister-cluster
+
+Important: This script is not part of the Anthos on Azure product and is not reflective of how the GA product will function. This script only exists while gcloud support is being built.
+"
+  exit 1
+    ;;
+esac

@@ -1,0 +1,13 @@
+# Anthos cluster name
+export CLUSTER_NAME="cluster-1"
+# Anthos node pool name
+export NODE_POOL_NAME="cluster-1-node-pool-1"
+# Azure location to create the cluster
+export AZURE_REGION=[AZURE_REGION_NAME]"
+# An existing Azure VNet to use
+export VNET_RESOURCE_GROUP="[YOUR_RESOURCE_GROUP_NAME]"
+export VNET_NAME="[YOUR_VNET_NAME]"
+export SUBNET_NAME="[YOUR_SUBNET_NAME]"
+# The Google Cloud region to call the API and store the cluster state
+# us-west1 or europe-west1 only
+export GCP_REGION="us-west1"
