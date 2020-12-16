@@ -66,36 +66,11 @@ create-vnet() {
   get-config
   get-vars
 
-  az network nsg create -n "nsg-allowallinout" -g "${VNET_RESOURCE_GROUP}"
-
-  az network nsg rule create -n "allowallin" -g "${VNET_RESOURCE_GROUP}" \
-    --access allow \
-    --destination-address-prefix '*' \
-    --destination-port-range '*' \
-    --direction inbound \
-    --nsg-name "nsg-allowallinout" \
-    --protocol tcp \
-    --source-address-prefix '*' \
-    --source-port-range '*' \
-    --priority 100
-
-  az network nsg rule create -n "allowallout" -g "${VNET_RESOURCE_GROUP}" \
-    --access allow \
-    --destination-address-prefix '*' \
-    --destination-port-range '*' \
-    --direction outbound \
-    --nsg-name "nsg-allowallinout" \
-    --protocol tcp \
-    --source-address-prefix '*' \
-    --source-port-range '*' \
-    --priority 101
-
   az network vnet create -n "${VNET_NAME}" -g "${VNET_RESOURCE_GROUP}" \
     --address-prefix 10.0.0.0/16
 
   az network vnet subnet create -n ${SUBNET_NAME} -g "${VNET_RESOURCE_GROUP}" \
     --vnet-name "${VNET_NAME}" \
-    --network-security-group "nsg-allowallinout" \
     --address-prefixes 10.0.1.0/24
 
   echo "Created VNet ${VNET_NAME} and subnet ${SUBNET_NAME}."
@@ -115,8 +90,10 @@ create-secrets() {
     --replication-policy="automatic" \
     --data-file=-
 
-  GKE_SA="gke-multicloud-service@boq-nonprod-gkemulticloud.iam.gserviceaccount.com"
-  gcloud projects add-iam-policy-binding $(gcloud config get-value project) \
+  GKE_SA="$(gcloud beta services identity create \
+    --service=gkemulticloud.googleapis.com \
+    --format='value(email)')"
+  gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="serviceAccount:${GKE_SA}" \
     --role="roles/secretmanager.secretAccessor" \
     --condition="expression=resource.name=='${SECRET_NAME}',title=anthos_service_account_access,description=Allow Anthos service account access to secret"
@@ -130,8 +107,8 @@ create-secrets() {
   rm /tmp/tmpcert.pem
 
   export ANTHOS_SA_APP_ID=$(az ad app list --all \
-  --query "[?displayName=='${ANTHOS_SA_APP_NAME}'].appId" \
-  --all --output tsv)
+    --query "[?displayName=='${ANTHOS_SA_APP_NAME}'].appId" \
+    --all --output tsv)
 
   az ad sp create --id "${ANTHOS_SA_APP_ID}"
 
@@ -170,9 +147,10 @@ create-cluster() {
   get-config
   get-vars
 
-  # TODO:  Clean up
-  ssh-keygen -t rsa -m PEM -b 4096 -C "ssh key for Anthos VMs created by $USER" \
-    -f ./anthos-azure-ssh-key -N ""
+  if [[ -f ./anthos-azure-ssh-key.pub ]]; then
+    ssh-keygen -t rsa -m PEM -b 4096 -C "ssh key for Anthos VMs created by $USER" \
+      -f ./anthos-azure-ssh-key -N ""
+  fi
   export SSH_PUBLIC_KEY=$(cat ./anthos-azure-ssh-key.pub | base64 -w 0)
 
   cat > create_cluster.json <<EOF
@@ -186,7 +164,7 @@ create-cluster() {
         "service_address_cidr_blocks":"10.32.0.0/24"
     },
     "control_plane": {
-        "version": "1.18",
+        "version": "1.18.10-gke.900",
         "subnet_id": "${SUBNET_ID}",
         "vm_size": "Standard_DS1_v2",
        "ssh_public_key": "${SSH_PUBLIC_KEY}",
@@ -211,7 +189,7 @@ EOF
 
   set -x
   curl -X POST \
-    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters?azure_cluster_id=${CLUSTER_NAME} \
+    https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters?azure_cluster_id=${CLUSTER_NAME} \
     -H "Content-Type: application/json" \
     -H "X-GFE-SSL: yes" \
     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
@@ -231,7 +209,7 @@ create-node-pool() {
   cat > create_nodepool.json <<EOF 
 {
     "name": "${NODE_POOL_NAME}",
-    "version": "1.18",
+    "version": "1.18.10-gke.900",
     "subnet_id": "${SUBNET_ID}",
     "autoscaling": {
         "min_node_count": 2,
@@ -244,7 +222,7 @@ EOF
 
   set -x
   curl -X POST \
-    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/"${PROJECT_NUMBER}"/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}/azureNodePools?azure_node_pool_id=${NODE_POOL_NAME} \
+    https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/"${PROJECT_NUMBER}"/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}/azureNodePools?azure_node_pool_id=${NODE_POOL_NAME} \
     -H "Content-Type: application/json" \
     -H "X-GFE-SSL: yes" \
     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
@@ -262,7 +240,7 @@ get-cluster() {
 
   set -x
   curl -X GET \
-    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME} \
+    https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME} \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer `gcloud auth print-access-token`"
   exit 0
@@ -275,7 +253,7 @@ get-node-pool() {
 
   set -x
   curl -X GET \
-    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}/azureNodePools/${NODE_POOL_NAME} \
+    https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}/azureNodePools/${NODE_POOL_NAME} \
     -H "Content-Type: application/json" \
     -H "X-GFE-SSL: yes" \
     -H "Authorization: Bearer $(gcloud auth print-access-token)"
@@ -288,7 +266,7 @@ get-credentials() {
   get-vars
 
   curl -X GET \
-    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}:getAzureClusterAdminKubeconfig \
+    https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}:getAzureClusterAdminKubeconfig \
     -H "Content-Type: application/json" \
     -H "X-GFE-SSL: yes" \
     -H "Authorization: Bearer $(gcloud auth print-access-token)" | \
@@ -324,7 +302,6 @@ delete-vnet() {
   get-vars
 
   az network vnet delete --ids "${VNET_ID}"
-  az network nsg delete -n "nsg-allowallinout" -g "${VNET_RESOURCE_GROUP}"
 
   echo "The VNet ${VNET_NAME} has been deleted."
   exit 0
@@ -353,7 +330,7 @@ delete-cluster() {
   get-vars
 
   curl -X DELETE \
-    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME} \
+    https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME} \
     -H "Content-Type: application/json" \
     -H "X-GFE-SSL: yes" \
     -H "Authorization: Bearer $(gcloud auth print-access-token)"
@@ -369,7 +346,7 @@ delete-node-pool() {
 
   set -x
   curl -X DELETE \
-    https://us-west1-preprod-gkemulticloud.sandbox.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}/azureNodePools/${NODE_POOL_NAME}\
+    https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}/azureNodePools/${NODE_POOL_NAME}\
     -H "Content-Type: application/json" \
     -H "X-GFE-SSL: yes" \
     -H "Authorization: Bearer $(gcloud auth print-access-token)"
@@ -384,7 +361,7 @@ register-cluster() {
   get-config
   get-vars
 
-  gcloud iam service-accounts create ${CONNECT_SA_NAME}
+  gcloud iam service-accounts create ${CONNECT_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com
   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="serviceAccount:${CONNECT_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/gkehub.connect" \
