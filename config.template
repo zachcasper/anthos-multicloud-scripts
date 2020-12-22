@@ -3,6 +3,8 @@ export CLUSTER_NAME="cluster-1"
 # Anthos node pool name
 export NODE_POOL_NAME="cluster-1-node-pool-1"
 # Azure location to create the cluster
+# Current valid values are [australiaeast canadacentral centralus eastus eastus2
+# francecentral japaneast northeurope southeastasia uksouth westeurope westus2] 
 # Example:  southcentralus
 export AZURE_REGION="[AZURE_REGION_NAME]"
 # An existing Azure VNet to use

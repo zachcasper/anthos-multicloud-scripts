@@ -66,6 +66,8 @@ create-vnet() {
   get-config
   get-vars
 
+  az group create --location "${AZURE_REGION}" --name "${VNET_RESOURCE_GROUP}"
+
   az network vnet create -n "${VNET_NAME}" -g "${VNET_RESOURCE_GROUP}" \
     --address-prefix 10.0.0.0/16
 
@@ -73,7 +75,7 @@ create-vnet() {
     --vnet-name "${VNET_NAME}" \
     --address-prefixes 10.0.1.0/24
 
-  echo "Created VNet ${VNET_NAME} and subnet ${SUBNET_NAME}."
+  echo "Created VNet ${VNET_NAME} and subnet ${SUBNET_NAME} in resource group ${VNET_RESOURCE_GROUP}."
   exit 0
 }
 
@@ -93,10 +95,11 @@ create-secrets() {
   GKE_SA="$(gcloud beta services identity create \
     --service=gkemulticloud.googleapis.com \
     --format='value(email)')"
+
   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="serviceAccount:${GKE_SA}" \
     --role="roles/secretmanager.secretAccessor" \
-    --condition="expression=resource.name=='${SECRET_NAME}',title=anthos_service_account_access,description=Allow Anthos service account access to secret"
+    --condition="expression=resource.name=='projects/${PROJECT_NUMBER}/secrets/${SECRET_NAME}/versions/latest',title=anthos_service_account_access,description=Allow Anthos service account access to secret"
 
   echo "Created secret ${SECRET_NAME} in Google Secrets Manager"
 
@@ -105,6 +108,7 @@ create-secrets() {
     --key-value "${CERT_CONTENT}"
 
   rm /tmp/tmpcert.pem
+  rm /tmp/tmpkey.pem
 
   export ANTHOS_SA_APP_ID=$(az ad app list --all \
     --query "[?displayName=='${ANTHOS_SA_APP_NAME}'].appId" \
@@ -279,7 +283,7 @@ get-credentials() {
     export KUBECONFIG=${HOME}/.kube/config:${HOME}/.kube/${CLUSTER_NAME}.yaml
     kubectl config view --merge --flatten > ${HOME}/.kube/merged_kubeconfig
     mv ${HOME}/.kube/merged_kubeconfig ${HOME}/.kube/config
-  unset KUBECONFIG
+    unset KUBECONFIG
   else
     export OLD_KUBECONFIG=$KUBECONFIG
     export KUBECONFIG=${KUBECONFIG}:${HOME}/.kube/${CLUSTER_NAME}.yaml
@@ -303,7 +307,9 @@ delete-vnet() {
 
   az network vnet delete --ids "${VNET_ID}"
 
-  echo "The VNet ${VNET_NAME} has been deleted."
+  az group delete --name "${VNET_RESOURCE_GROUP}"
+
+  echo "The VNet ${VNET_NAME} and resource group ${VNET_RESOURCE_GROUP} have been deleted."
   exit 0
 
 }
@@ -361,7 +367,7 @@ register-cluster() {
   get-config
   get-vars
 
-  gcloud iam service-accounts create ${CONNECT_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com
+  gcloud iam service-accounts create ${CONNECT_SA_NAME}
   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
     --member="serviceAccount:${CONNECT_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role="roles/gkehub.connect" \
