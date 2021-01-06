@@ -30,6 +30,7 @@ get-config() {
 }
 
 get-vars() {
+
   # Azure subscription ID, assumes the default subscription
   export SUBSCRIPTION_ID=$(az account show --query id -o tsv)
   # Azure AD tenant ID
@@ -42,10 +43,6 @@ get-vars() {
     --vnet-name "${VNET_NAME}" \
     --query "[?name=='${SUBNET_NAME}'].{ID:id}" \
     --output tsv)
-  # Azure ssh key if exists (if not, it will be created later)
-  if [[ -f ./anthos-azure-ssh-key.pub ]]; then 
-    export SSH_PUBLIC_KEY=$(cat ./anthos-azure-ssh-key.pub | base64 -w 0)
-  fi
   # The Google Cloud project this cluster will be associated with
   export PROJECT_ID="$(gcloud config get-value project)"
   export PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" \
@@ -58,11 +55,10 @@ get-vars() {
   export ANTHOS_SA_APP_ID=$(az ad app list --all \
     --query "[?displayName=='${ANTHOS_SA_APP_NAME}'].appId" \
     --all --output tsv)
-  # Google service account for the Connect agent to communicate with Google
-  export CONNECT_SA_NAME=${CLUSTER_NAME}-sa
 }
 
 create-vnet() {
+
   get-config
   get-vars
 
@@ -80,6 +76,7 @@ create-vnet() {
 }
 
 create-secrets() {
+
   get-config
   get-vars
 
@@ -148,19 +145,27 @@ Managed Application Contributor Role
 }
 
 create-cluster() {
+
+  if [[ -z "${1}" ]]; then
+    echo "Usage: anthos-az create-cluster CLUSTER_NAME"
+    exit 1
+  fi
+  export CLUSTER_NAME="${1}"
+
   get-config
   get-vars
 
-  if [[ -f ./anthos-azure-ssh-key.pub ]]; then
+  if [[ ! -f ./${CLUSTER_NAME}-ssh-key.pub ]]; then
     ssh-keygen -t rsa -m PEM -b 4096 -C "ssh key for Anthos VMs created by $USER" \
-      -f ./anthos-azure-ssh-key -N ""
+      -f ./${CLUSTER_NAME}-ssh-key -N ""
+    echo "A new ssh key has been created and stored in ./${CLUSTER_NAME}-ssh-key."
   fi
-  export SSH_PUBLIC_KEY=$(cat ./anthos-azure-ssh-key.pub | base64 -w 0)
+  export SSH_PUBLIC_KEY=$(cat ./${CLUSTER_NAME}-ssh-key.pub | base64 -w 0)
 
   cat > create_cluster.json <<EOF
 {
     "name": "${CLUSTER_NAME}",
-    "description": "My first Anthos cluster",
+    "description": "Anthos cluster ${CLUSTER_NAME}",
     "azure_region": "${AZURE_REGION}",
     "networking": {
         "virtual_network_id": "${VNET_ID}",
@@ -171,7 +176,7 @@ create-cluster() {
         "version": "1.18.10-gke.900",
         "subnet_id": "${SUBNET_ID}",
         "vm_size": "Standard_DS1_v2",
-       "ssh_public_key": "${SSH_PUBLIC_KEY}",
+        "ssh_public_key": "${SSH_PUBLIC_KEY}",
         "root_volume": {
             "size_gib": 16
         },
@@ -191,24 +196,43 @@ create-cluster() {
 }
 EOF
 
-  set -x
-  curl -X POST \
+  curl -s -X POST \
     https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters?azure_cluster_id=${CLUSTER_NAME} \
     -H "Content-Type: application/json" \
     -H "X-GFE-SSL: yes" \
     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
     -d @create_cluster.json
-  set +x
 
-  echo "The cluster ${CLUSTER_NAME} is being created. The Cluster configuration file is was kept in create_cluster.json.  Use anthos-az get-cluster to check the cluster status."
-  echo "A new ssh key has been created and stored in ./anthos-azure-ssh-key."
+  cat create_cluster.json
+  rm create_cluster.json
+
+  echo "The cluster ${CLUSTER_NAME} is being created. Use anthos-az get-cluster to check the cluster status."
   exit 0
 
 }
 
 create-node-pool() {
+
+  if [[ -z "$1" ]]; then
+    echo "Usage: anthos-az create-node-pool CLUSTER_NAME NODE_POOL_NAME"
+    exit 1
+  fi
+  if [[ -z "$2" ]]; then
+    echo "Usage: anthos-az create-node-pool CLUSTER_NAME NODE_POOL_NAME"
+    exit 1
+  fi
+  export CLUSTER_NAME="${1}"
+  export NODE_POOL_NAME="${2}"
+
   get-config
   get-vars
+
+  if [[ ! -f ./${CLUSTER_NAME}-ssh-key.pub ]]; then
+    ssh-keygen -t rsa -m PEM -b 4096 -C "ssh key for Anthos VMs created by $USER" \
+      -f ./${CLUSTER_NAME}-ssh-key -N ""
+    echo "A new ssh key has been created and stored in ./${CLUSTER_NAME}-ssh-key."
+  fi
+  export SSH_PUBLIC_KEY=$(cat ./${CLUSTER_NAME}-ssh-key.pub | base64 -w 0)
 
   cat > create_nodepool.json <<EOF 
 {
@@ -224,26 +248,48 @@ create-node-pool() {
 }
 EOF
 
-  set -x
-  curl -X POST \
+  curl -s -X POST \
     https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/"${PROJECT_NUMBER}"/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}/azureNodePools?azure_node_pool_id=${NODE_POOL_NAME} \
     -H "Content-Type: application/json" \
     -H "X-GFE-SSL: yes" \
     -H "Authorization: Bearer $(gcloud auth print-access-token)" \
     -d @create_nodepool.json
-  set +x
 
-  echo "The node poll ${NODE_POOL_NAME} is being created. The node pool configuration file is was kept in create_nodepool.json. Use anthos-az get-node-pool to check the node pool status."
+  cat create_nodepool.json
+  rm create_nodepool.json
+
+  echo "The node poll ${NODE_POOL_NAME} is being created. Use anthos-az get-node-pool to check the node pool status."
   exit 0
 
 }
 
-get-cluster() {
+get-environment-config() {
+
   get-config
   get-vars
 
-  set -x
-  curl -X GET \
+  echo "Google Project ID:" ${PROJECT_ID}
+  echo "Google Cloud Region:" ${GCP_REGION}
+  echo "Azure Subscription:" $(az account show --query name)
+  echo "Azure Region:" ${AZURE_REGION}
+  echo "Azure VNet Resource Group:" ${VNET_RESOURCE_GROUP}
+  echo "Azure VNet Name:" ${VNET_NAME}
+  echo "Azure Subnet Name:" ${SUBNET_NAME}
+
+}
+
+get-cluster() {
+
+  if [[ -z "$1" ]]; then
+    echo "Usage: anthos-az get-cluster CLUSTER_NAME"
+    exit 1
+  fi
+  export CLUSTER_NAME="${1}"
+
+  get-config
+  get-vars
+
+  curl -s -X GET \
     https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME} \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer `gcloud auth print-access-token`"
@@ -252,24 +298,41 @@ get-cluster() {
 }
 
 get-node-pool() {
+
+  if [[ -z "$1" ]]; then
+    echo "Usage: anthos-az get-node-pool CLUSTER_NAME NODE_POOL_NAME"
+    exit 1
+  fi
+  if [[ -z "$2" ]]; then
+    echo "Usage: anthos-az get-node-pool CLUSTER_NAME NODE_POOL_NAME"
+    exit 1
+  fi
+  export CLUSTER_NAME="${1}"
+  export NODE_POOL_NAME="${2}"
+
   get-config
   get-vars
 
-  set -x
-  curl -X GET \
+  curl -s -X GET \
     https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}/azureNodePools/${NODE_POOL_NAME} \
     -H "Content-Type: application/json" \
     -H "X-GFE-SSL: yes" \
     -H "Authorization: Bearer $(gcloud auth print-access-token)"
-  exit 0
 
 }
 
 get-credentials() {
+
+  if [[ -z "$1" ]]; then
+    echo "Usage: anthos-az get-credentials CLUSTER_NAME"
+    exit 1
+  fi
+  export CLUSTER_NAME="${1}"
+
   get-config
   get-vars
 
-  curl -X GET \
+  curl -s -X GET \
     https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}:getAzureClusterAdminKubeconfig \
     -H "Content-Type: application/json" \
     -H "X-GFE-SSL: yes" \
@@ -300,6 +363,67 @@ get-credentials() {
   exit 0
 
 }
+
+get-operation() {
+
+  if [[ -z "$1"  ]]; then
+    echo "Usage: anthos-az get-operation OPERATION_ID"
+    exit 1
+  fi
+  export OPERATION_ID="${1}"
+
+  get-config
+  get-vars
+
+  curl -s -X GET \
+    https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/operations/${OPERATION_ID} \
+    -H "Content-Type: application/json" \
+    -H "X-GFE-SSL: yes" \
+    -H "Authorization: Bearer $(gcloud auth print-access-token)" 
+}
+
+list-clusters() {
+  get-config
+  get-vars
+
+  curl -s -X GET \
+    https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters \
+    -H "Content-Type: application/json" \
+    -H "X-GFE-SSL: yes" \
+    -H "Authorization: Bearer $(gcloud auth print-access-token)" | \
+    jq ".azureClusters[]? | {name: .name, description: .description, azureRegion: .azureRegion}"
+}
+
+list-node-pools() {
+
+  if [[ -z "$1" ]]; then
+    echo "Usage: anthos-az list-node-pools CLUSTER_NAME"
+    exit 1
+  fi
+  export CLUSTER_NAME="${1}"
+
+  get-config
+  get-vars
+
+  curl -s -X GET \
+    https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}/azureNodePools \
+    -H "Content-Type: application/json" \
+    -H "X-GFE-SSL: yes" \
+    -H "Authorization: Bearer $(gcloud auth print-access-token)" | \
+     jq ".azureNodePools[]? | {name: .name}"
+}
+
+# Not implemented yet in the API
+#list-operations() {
+#  get-config
+#  get-vars
+#
+#  curl -s -X GET \
+#    https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/operations \
+#    -H "Content-Type: application/json" \
+#    -H "X-GFE-SSL: yes" \
+#    -H "Authorization: Bearer $(gcloud auth print-access-token)" 
+#}
 
 delete-vnet() {
   get-config
@@ -332,10 +456,17 @@ delete-secrets() {
 }
 
 delete-cluster() {
+
+  if [[ -z "$1" ]]; then
+    echo "Usage: anthos-az delete-cluster CLUSTER_NAME"
+    exit 1
+  fi
+  export CLUSTER_NAME="${1}"
+
   get-config
   get-vars
 
-  curl -X DELETE \
+  curl -s -X DELETE \
     https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME} \
     -H "Content-Type: application/json" \
     -H "X-GFE-SSL: yes" \
@@ -347,11 +478,23 @@ delete-cluster() {
 }
 
 delete-node-pool() {
+
+  if [[ -z "$1" ]]; then
+    echo "Usage: anthos-az delete-node-pool CLUSTER_NAME NODE_POOL_NAME"
+    exit 1
+  fi
+  if [[ -z "$2" ]]; then
+    echo "Usage: anthos-az delete-node-pool CLUSTER_NAME NODE_POOL_NAME"
+    exit 1
+  fi
+  export CLUSTER_NAME="${1}"
+  export NODE_POOL_NAME="${2}"
+
   get-config
   get-vars
 
   set -x
-  curl -X DELETE \
+  curl -s -X DELETE \
     https://${GCP_REGION}-gkemulticloud.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/${GCP_REGION}/azureClusters/${CLUSTER_NAME}/azureNodePools/${NODE_POOL_NAME}\
     -H "Content-Type: application/json" \
     -H "X-GFE-SSL: yes" \
@@ -364,8 +507,17 @@ delete-node-pool() {
 }
 
 register-cluster() {
+
+  if [[ -z "$1" ]]; then
+    echo "Usage: anthos-az register-cluster CLUSTER_NAME"
+    exit 1
+  fi
+  export CLUSTER_NAME="${1}"
+
   get-config
   get-vars
+
+  export CONNECT_SA_NAME=${CLUSTER_NAME}-sa
 
   gcloud iam service-accounts create ${CONNECT_SA_NAME}
   gcloud projects add-iam-policy-binding ${PROJECT_ID} \
@@ -393,8 +545,17 @@ register-cluster() {
 }
 
 unregister-cluster() {
+
+  if [[ -z "$1" ]]; then
+    echo "Usage: anthos-az register-cluster CLUSTER_NAME"
+    exit 1
+  fi
+  export CLUSTER_NAME="${1}"
+
   get-config
   get-vars
+
+  export CONNECT_SA_NAME=${CLUSTER_NAME}-sa
 
   set +e
   gcloud container hub memberships delete ${CLUSTER_NAME}
@@ -413,19 +574,34 @@ case $1 in
     create-secrets
     ;;
   create-cluster)
-    create-cluster
+    create-cluster $2
     ;;
   create-node-pool)
-    create-node-pool
+    create-node-pool $2 $3
+    ;;
+  get-environment-config)
+    get-environment-config
     ;;
   get-cluster)
-    get-cluster
+    get-cluster $2
     ;;
   get-node-pool)
-    get-node-pool
+    get-node-pool $2 $3
     ;;
   get-credentials)
-    get-credentials
+    get-credentials $2
+    ;;
+  get-operation)
+    get-operation $2
+    ;;
+  list-node-pools)
+    list-node-pools $2
+    ;;
+  list-clusters)
+    list-clusters
+    ;;
+  list-operations)
+    list-operations
     ;;
   delete-vnet)
     delete-vnet
@@ -434,20 +610,20 @@ case $1 in
     delete-secrets
     ;;
   delete-cluster)
-    delete-cluster
+    delete-cluster $2
     ;;
   delete-node-pool)
-    delete-node-pool
+    delete-node-pool $2 $3
     ;;
   register-cluster)
-    register-cluster
+    register-cluster $2
     ;;
   unregister-cluster)
-    unregister-cluster
+    unregister-cluster $2
     ;;
   *)
     echo "
-Usage:  anthos-az COMMAND
+Usage:  anthos-az COMMAND [CLUSTER_NAME] [NODE_POOL_NAME]
 
 All commands read from ./config
 Commands:
@@ -455,9 +631,14 @@ Commands:
   create-secrets
   create-cluster
   create-node-pool
+  get-environment-config
   get-cluster
   get-node-pool
   get-credentials
+  get-operation
+  list-clusters
+  list-node-pools
+  list-operations
   delete-vnet
   delete-secrets
   delete-cluster
